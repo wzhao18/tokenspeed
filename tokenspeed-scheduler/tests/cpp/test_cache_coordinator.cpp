@@ -4232,6 +4232,36 @@ TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin)
     EXPECT_EQ(coord.GroupPrefixIndex(1).NumEntries(pool), 0);
 }
 
+TEST(BoundedReplayCoordinator, AdmitKeepsAReplayableDemandShapedAsARemoteLanding) {
+    BlockPool pool(32, {1, 1});
+    CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, nullptr, false);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coord, pool, hash, 0);
+    }
+
+    // A D role hits P = 16 on full and lands a 22-token prompt from its peer.
+    // The peer computed the replayable rows, so the caller already shaped the
+    // group as the landed retained window (retention 12: pages [2, 6)) and
+    // Admit leaves that demand alone instead of replaying from 16 - 8.
+    std::vector<BlockTable> tables(2);
+    std::vector<GroupDemand> demands = {
+        GroupDemand{.table = &tables[0], .num_tokens = 6},
+        GroupDemand{.table = &tables[1], .num_tokens = 22, .materialized_suffix_start = 2},
+    };
+    const std::optional<CacheCoordinator::AdmissionResult> admitted =
+        coord.Admit(coord.ProbePrefix(hashes), demands, std::nullopt);
+    ASSERT_TRUE(admitted.has_value());
+    EXPECT_EQ(admitted->device_prefix_tokens, 16);
+    ASSERT_EQ(tables[1].NumBlocks(), 6);
+    EXPECT_FALSE(tables[1].Blocks()[0]);
+    EXPECT_FALSE(tables[1].Blocks()[1]);
+    for (std::int32_t slot = 2; slot < 6; ++slot) {
+        EXPECT_TRUE(tables[1].Blocks()[static_cast<std::size_t>(slot)]) << "swa slot " << slot;
+    }
+    EXPECT_EQ(admitted->new_page_ids[1].size(), 4u);
+}
+
 TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
     BlockPool pool(32, {1, 1});
     BlockPool host_pool(16, {1, 1});

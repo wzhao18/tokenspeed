@@ -384,17 +384,19 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // empty: materialize it as a sparse private suffix from the replay
     // window's first token -- the slots below stay null holes, as
     // absolute-slot tables require -- and the model regenerates the rows.
-    // Closed groups keep their dense demand beyond the hit.
+    // Closed groups keep their dense demand beyond the hit. A remote landing
+    // (D role) already shaped the group as the peer's retained window: the
+    // peer computed those rows, so nothing is replayed and the demand stands.
     std::vector<GroupDemand> replayed;
     const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
     if (replay_window_tokens_ > 0 && hit_tokens > 0) {
         const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
         replayed.assign(demands.begin(), demands.end());
         for (std::size_t i = 0; i < replayed.size(); ++i) {
-            if (!GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || replayed[i].materialized_suffix_start >= 0) {
                 continue;
             }
-            _assert(replayed[i].table->NumBlocks() == 0 && replayed[i].materialized_suffix_start < 0,
+            _assert(replayed[i].table->NumBlocks() == 0,
                     "a replayable group holds no hit pages and takes a dense demand at admission");
             replayed[i].num_tokens += hit_tokens;
             replayed[i].materialized_suffix_start = replay_begin / geometry_[i].BlockGranularity();

@@ -421,10 +421,24 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
         seen["requests"] = request_indices.clone()
         return _history_slots(start_pos, 128, 64), None
 
-    backend = SimpleNamespace(
-        query_metadata=lambda mode: metas[mode], window_slots=window_slots
+    # The CED decoder ran on every row here (identity view), so the view is
+    # the extend rows followed by the decode rows.
+    view = SimpleNamespace(
+        metadata=SimpleNamespace(
+            positions=torch.cat((extend_positions, decode_positions)),
+            swa_write_slots=torch.cat(
+                (
+                    metas[ForwardMode.EXTEND].swa_write_slots,
+                    metas[ForwardMode.DECODE].swa_write_slots,
+                )
+            ),
+        )
     )
-    ib.extend_seq_lens_cpu[:1] = 3
+    backend = SimpleNamespace(
+        query_metadata=lambda mode: metas[mode],
+        decoder_view=lambda: view,
+        window_slots=window_slots,
+    )
     ctx = _ctx(None, 3 + width, ForwardMode.MIXED)
     ctx.bs, ctx.num_extends = 2, 1
     ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
@@ -451,6 +465,31 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     written = torch.cat((extend_positions, decode_positions))
     slots = _paged_slots(written, 64)
     assert windows[:, 0].count_nonzero() == 0
+    assert (windows[:, slots // 64, slots % 64] != 0).any(dim=-1).all()
+    assert (
+        windows.count_nonzero() == windows[:, slots // 64, slots % 64].count_nonzero()
+    )
+
+    # A chunk that leaves its prompt open reaches the CED decoder as one row:
+    # the capture holds that row plus the decode rows, and only those slots
+    # are written.
+    view.metadata = SimpleNamespace(
+        positions=torch.cat((extend_positions[-1:], decode_positions)),
+        swa_write_slots=torch.cat(
+            (
+                metas[ForwardMode.EXTEND].swa_write_slots[-1:],
+                metas[ForwardMode.DECODE].swa_write_slots,
+            )
+        ),
+    )
+    windows.zero_()
+    drafter.run(
+        base_ctx=ctx,
+        logits_output=SimpleNamespace(hidden_states=hidden[2:]),
+        output_tokens=output_tokens,
+        accept_lengths=accept_lengths,
+    )
+    slots = _paged_slots(view.metadata.positions, 64)
     assert (windows[:, slots // 64, slots % 64] != 0).any(dim=-1).all()
     assert (
         windows.count_nonzero() == windows[:, slots // 64, slots % 64].count_nonzero()

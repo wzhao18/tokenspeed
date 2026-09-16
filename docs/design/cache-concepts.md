@@ -706,7 +706,11 @@ The rows it re-feeds carry `extend_replay_lens_cpu` down the extend bundle
 
 The same backend narrows the CED decoder to each request's prompt tail
 (`decoder_view()`); the decoder's SWA rows are decode-only state and, being
-in the replayable group, are never expected from a hit either.
+in the replayable group, are never expected from a hit either. Under PD a
+replayable group is still transferred: the prefill node replays into its
+private pages and the `full_suffix` policy ships the retained window; the
+decode node lands it whole (its own hit, if any, holds no page of that
+group) and never re-feeds ([Scheduler §1.3](scheduler.md#13-bounded-replay)).
 
 Block drafters (DFLASH / DSPARK) write their KV at the target's cache
 locations, so their storage *is* a target-owned group whatever mask their

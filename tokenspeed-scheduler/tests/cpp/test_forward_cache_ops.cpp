@@ -578,7 +578,7 @@ TEST(SchedulerConfigValidateTest, ReplayWindowMustBePositiveAndFitASlidingHistor
     ExpectRejectedNamingGroup(config, "swa");
 }
 
-TEST(SchedulerConfigValidateTest, ReplayRequiresFusedRoleTwoWindowsOfBudgetAndNoSnapshotState) {
+TEST(SchedulerConfigValidateTest, ReplayRequiresTwoWindowsOfBudgetAndNoSnapshotState) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig swa;
     swa.group_id = "swa";
@@ -612,13 +612,22 @@ TEST(SchedulerConfigValidateTest, ReplayRequiresFusedRoleTwoWindowsOfBudgetAndNo
     with_state.cache_groups.push_back(state);
     EXPECT_THROW(with_state.Validate(), std::invalid_argument) << "replay and snapshot-state groups do not mix";
 
+    // The P role prefills like the fused engine and keeps the budget rule; the
+    // D role lands the peer's window and never re-feeds, so its decode-sized
+    // budget is exempt.
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = config;
         pd.role = role;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
-        EXPECT_THROW(pd.Validate(), std::invalid_argument) << "replayable groups are Fused-only";
+        EXPECT_NO_THROW(pd.Validate());
+        pd.max_scheduled_tokens = 255;
+        if (role == Role::kP) {
+            EXPECT_THROW(pd.Validate(), std::invalid_argument) << "a P hit chunk re-feeds the window";
+        } else {
+            EXPECT_NO_THROW(pd.Validate());
+        }
     }
 }
 

@@ -45,12 +45,13 @@ SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_contain
         .cache_progress = std::move(cache_progress_),
         .results_in_flight = 0,
     };
-    // A hit re-feeds the replay window before it (bounded replay; 0 on the P
-    // and D roles, which SchedulerConfig::Validate keeps replay-free).
+    // A local hit re-feeds the replay window before it (bounded replay). A
+    // remote prefill computes nothing here: the peer lands the retained
+    // window of every replayable group with the rest of the prompt.
     const TokenContainer::Window window{
         .begin = hit_tokens_,
         .size = tokens_this_round_,
-        .replay = coordinator_->ReplayTokens(hit_tokens_),
+        .replay = source_ == PrefillSource::kRemote ? 0 : coordinator_->ReplayTokens(hit_tokens_),
     };
     if (source_ == PrefillSource::kRemote) {
         // The peer prefills the whole prompt; this engine only holds the

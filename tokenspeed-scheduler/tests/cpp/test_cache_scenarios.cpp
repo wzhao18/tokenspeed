@@ -5003,4 +5003,105 @@ TEST_F(BoundedReplayMixedSuite, DecodeBatchLeavesRoomForTheReplayWindow) {
     EXPECT_EQ(op->request_ids.size(), 1u + 6u);
 }
 
+// Disaggregated roles. The P role prefills like the fused engine, so a hit
+// re-feeds the window and the regenerated rows travel to the peer with the
+// rest of the retained window; the D role computes nothing and lands that
+// window whole, whatever its own closed groups hit.
+class BoundedReplayPrefillRoleSuite : public BoundedReplaySuite {
+protected:
+    virtual Role RoleUnderTest() const { return Role::kP; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = BoundedReplaySuite::MakeConfig();
+        cfg.role = RoleUnderTest();
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendRemotePrefillDone(const std::string& request_id, std::int32_t bootstrap_token) {
+        ExecutionEvent event;
+        event.With(pd::RemotePrefillDoneEvent{request_id, bootstrap_token});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(BoundedReplayPrefillRoleSuite, PrefillRoleReplaysTheWindowAfterAHit) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    Submit(r1);
+    SendBootstrapped("r1");
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->extend_replay_lens.at(0), 0);
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendSucceeded("r1");
+    PlanOnce();
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/40 / 4, "swa");
+}
+
+class BoundedReplayDecodeRoleSuite : public BoundedReplayPrefillRoleSuite {
+protected:
+    Role RoleUnderTest() const override { return Role::kD; }
+    // Decode-sized budget: below W + max(W, P), which only a re-feeding role needs.
+    std::int32_t MaxScheduledTokens() const override { return 8; }
+};
+
+TEST_F(BoundedReplayDecodeRoleSuite, DecodeRoleLandsTheWholeRetainedWindowWithoutReplay) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    Submit(r1);
+    SendBootstrapped("r1");
+    const ExecutionPlan landing_plan = PlanOnce();
+    const ForwardBatch* landing = FindRemoteAdmission(landing_plan);
+    ASSERT_NE(landing, nullptr);
+    EXPECT_EQ(landing->extend_replay_lens.at(0), 0);
+    SendRemotePrefillDone("r1", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("r1", {43});
+    SendFinish("r1");
+    PlanOnce();
+
+    // r2 hits r1's 32 closed tokens locally; the peer still prefills the 40
+    // tokens and lands swa's retained window (24 -> [17, 40), pages [4, 10))
+    // in full, since no swa page came from the hit. Nothing is re-fed.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindRemoteAdmission(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 32);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 0);
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/17 / 4, /*min_pages=*/40 / 4, "swa");
+}
+
 }  // namespace tokenspeed::test

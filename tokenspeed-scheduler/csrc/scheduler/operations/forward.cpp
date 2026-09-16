@@ -316,9 +316,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
+                // A replayable group claimed no hit pages, so the whole retained
+                // window lands; any other sliding group keeps the pages the hit
+                // already holds and lands from the hit on.
+                const std::int32_t landing_begin =
+                    coordinator_.GroupIsReplayable(static_cast<std::int32_t>(i)) ? 0 : hit_tokens;
                 demands[i].num_tokens = request->PrefillSize();
                 demands[i].materialized_suffix_start =
-                    std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
+                    std::max(landing_begin / block_granularity, retained_begin / block_granularity);
             }
         }
     }

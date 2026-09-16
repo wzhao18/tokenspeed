@@ -90,15 +90,13 @@ void SchedulerConfig::Validate() const {
         max_replay_window_tokens = std::max(max_replay_window_tokens, group.replay_window_tokens.value_or(0));
     }
     if (max_replay_window_tokens > 0) {
-        // Replayed groups are private to the fused engine: the PD destination
-        // layouts land cached pages, and a replayed group has none to land.
-        if (role != Role::kFused) {
-            throw std::invalid_argument("Scheduler: bounded-replay cache groups are only supported on the Fused role");
-        }
         // A prefix hit re-feeds up to one replay window and must still advance:
         // by every new token when fewer than a window remain, or by one prefix
-        // page when a promotion boundary aligns the chunk.
-        if (max_scheduled_tokens < max_replay_window_tokens + std::max(max_replay_window_tokens, prefix_granularity)) {
+        // page when a promotion boundary aligns the chunk. The D role never
+        // prefills locally -- its replayable groups land the peer's retained
+        // window -- so its decode-sized budget is not held to this.
+        if (role != Role::kD &&
+            max_scheduled_tokens < max_replay_window_tokens + std::max(max_replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the largest replay_window_tokens plus max(replay "
                 "window, prefix_granularity)");

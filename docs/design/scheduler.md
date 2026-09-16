@@ -214,10 +214,16 @@ mixed mode the decode batch leaves that same amount for a pending local
 prefill (`MinPrefillChunkTokens`, the same reserve the mamba checkpoint page
 uses). Replay is re-derived at every
 admission, so a retracted request carries nothing: its readmission re-probes
-and replays from the new `P`. Replayable groups are rejected on the P and D
-roles — their destination layouts land cached pages, and a replayed group has
-none — and cannot be combined with snapshot-state groups, whose chunk
-alignment would fight the final-window rule.
+and replays from the new `P`. Replayable groups cannot be combined with
+snapshot-state groups, whose chunk alignment would fight the final-window rule.
+
+Under disaggregation the P role replays exactly like the fused engine and
+transfers the regenerated rows with the rest of the group's retained window.
+The D role never re-feeds: a remote landing carries `replay = 0`, its
+replayable groups are shaped as the peer's whole retained window — no hit page
+of theirs exists to keep, so the landing starts at the window rather than at
+the local hit — and `Admit` leaves such a pre-shaped demand alone. The budget
+rule above therefore binds P and Fused only.
 
 ### 1.4 What bounds a single request
 

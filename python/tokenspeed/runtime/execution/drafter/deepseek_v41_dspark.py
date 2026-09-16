@@ -140,29 +140,6 @@ class DeepseekV41DSpark(BaseDrafter):
     def on_target_weights_updated(self) -> None:
         self.model.refresh_local_base_logits_head(self.lm_head.weight, force=True)
 
-    def _prefill_token_count(self, num_extends: int) -> int:
-        if num_extends <= 0:
-            return 0
-        # fill_input_buffers derives this host mirror from the same scheduler
-        # lengths as the backend's metadata; reading the CUDA buffer here would
-        # serialize every chunk behind the target stream.
-        lengths_cpu = self.input_buffers.extend_seq_lens_cpu
-        if (
-            not isinstance(lengths_cpu, torch.Tensor)
-            or lengths_cpu.device.type != "cpu"
-            or lengths_cpu.dtype != torch.int32
-            or lengths_cpu.ndim != 1
-            or lengths_cpu.numel() < num_extends
-        ):
-            raise RuntimeError(
-                "DSPARK prefill seeding requires a complete int32 CPU "
-                "extend-length mirror."
-            )
-        total = int(lengths_cpu[:num_extends].sum())
-        if total < 0:
-            raise RuntimeError("DSPARK prefill chunk lengths must be non-negative.")
-        return total
-
     def _draft_decode_rows(
         self,
         base_ctx: ForwardContext,
@@ -237,13 +214,15 @@ class DeepseekV41DSpark(BaseDrafter):
         backend = base_ctx.attn_backend
         pool = base_ctx.token_to_kv_pool
         num_extends = base_ctx.num_extends
-        prefill_tokens = self._prefill_token_count(num_extends)
-        num_decodes = base_ctx.bs - num_extends
-        decode_tokens = num_decodes * self.spec_num_tokens
-        if prefill_tokens + decode_tokens > hidden_states.shape[0]:
+        # The target captures its taps on the rows its CED decoder ran: each
+        # extend request's kept tail, then every verify row. The decoder view
+        # names those rows, so its positions and SWA slots address the capture.
+        meta = backend.decoder_view().metadata
+        num_rows = meta.positions.numel()
+        if num_rows > hidden_states.shape[0]:
             raise RuntimeError(
                 "DSPARK token rows exceed captured hidden-state rows: "
-                f"{prefill_tokens + decode_tokens} > {hidden_states.shape[0]}."
+                f"{num_rows} > {hidden_states.shape[0]}."
             )
 
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
@@ -256,20 +235,14 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         next_tokens[:, 1:].copy_(next_tokens[:, :1])
 
-        # Every target row writes its window row: prefill rows seed the
+        # Every captured row writes its window row: prefill rows seed the
         # prefix, verify rows refresh the block just verified. Rejected rows
         # sit past the anchor and are rewritten by the step that accepts them.
-        for mode, begin, count in (
-            (ForwardMode.EXTEND, 0, prefill_tokens),
-            (ForwardMode.DECODE, prefill_tokens, decode_tokens),
-        ):
-            if not count:
-                continue
-            meta = backend.query_metadata(mode)
+        if num_rows:
             self.model.write_context_kv(
-                hidden_states[begin : begin + count],
-                meta.positions[:count],
-                meta.swa_write_slots[:count],
+                hidden_states[:num_rows],
+                meta.positions,
+                meta.swa_write_slots,
                 pool,
             )
         self._draft_decode_rows(base_ctx, accept_lengths, next_tokens)

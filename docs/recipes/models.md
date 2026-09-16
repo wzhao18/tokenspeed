@@ -988,7 +988,12 @@ the truncation the model is trained for; the cached global KV is never
 recomputed from them.
 `usage.prompt_tokens_details.cached_tokens` reports the hit through the end
 of the replayed window, so it stays a multiple of the prefix granularity.
-Prefill/decode disaggregation is not implemented for V4.1.
+
+Under prefill/decode disaggregation the prefill node replays exactly as
+above and transfers the regenerated window with the rest of each group's
+retained tail; the decode node re-feeds nothing and lands that window whole
+(`--disaggregation-layerwise-interval 0`; see
+`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`).
 
 ## Tuning Order
 

@@ -767,6 +767,8 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
     decode._FP16_PARTIALS = partial_fp16
     workspace = torch.zeros(32 * 1024**2, dtype=torch.int8, device="cuda")
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    capability = torch.cuda.get_device_capability()
+    max_clusters = decode.get_max_active_clusters(2)
     original_compile = decode._get_compiled_mla_kernel
     selections = []
     stream_k_selections = []
@@ -784,8 +786,10 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
         (_Case(8, 32768, 96, 4), "fp8", True, True, False, True),
         (_Case(16, 32768, 96, 4), "fp8", True, True, False, True),
         (_Case(24, 32768, 96, 4), "fp8", True, True, False, True),
-        # Partial final rows, no reducer, and multiple persistent work items.
+        # Partial query tiles, short KV sequences, and the batch-size limit.
         (_Case(32, 128, 96, 5), "fp8", False, False, False, True),
+        # Cover the balanced scheduler's maximum supported batch.
+        (_Case(128, 129, 96, 5), "fp8", False, False, False, True),
         (_Case(1, 257, 48, 3), "fp8", False, True, False, True),
         # FP16/BF16 share packing, including tails, folding and PDL.
         (_Case(1, 129, 96, 4), "bf16", False, False, False, True),
@@ -808,6 +812,32 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
         # One long, uneven batch covers FP16 partials without duplicating the matrix.
         cases = [row for row in cases if row[0] == _Case(8, 32768, 96, 4)]
     for case, dtype, variable_kv, pdl, token_gap, expected_packed in cases:
+        query_tiles = (case.heads * case.q_len + 127) // 128
+        expected_stream_k = (
+            enable_stream_k
+            and dtype == "fp8"
+            and expected_packed
+            and case.heads == 96
+            and case.q_len in (4, 5, 8)
+            and capability in ((10, 0), (10, 3))
+            and 2 <= max_clusters // query_tiles <= 32
+        )
+        workspace_capacity = min(
+            32 * 1024**2, num_sms * case.heads * case.q_len * 513 * 4
+        )
+        if expected_stream_k:
+            plan = decode._get_stream_k_plan(
+                case.batch,
+                query_tiles,
+                512,
+                max_clusters,
+                512 * 1024**2,
+                (case.kv_len + 127) // 128,
+            )
+            assert plan is not None
+            workspace_capacity = max(workspace_capacity, plan[2])
+        if workspace.numel() < workspace_capacity:
+            workspace = torch.empty(workspace_capacity, dtype=torch.int8, device="cuda")
         q, kv, tables, lengths = _make_inputs(case, dtype, variable_kv, "cuda")
         if case == _Case(8, 32768, 96, 4):
             lengths.copy_(
@@ -839,8 +869,7 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
         kwargs = dict(
             query=q,
             kv_cache=kv,
-            # Exercise the runtime's workspace bound even for small H * Q.
-            workspace_buffer=workspace[: num_sms * case.heads * case.q_len * 513 * 4],
+            workspace_buffer=workspace[:workspace_capacity],
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             block_tables=tables,
@@ -862,8 +891,7 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
         )
         result, lse = _decode_with_schedule(**kwargs)
         assert selections[-1] is expected_packed
-        if not expected_packed or dtype != "fp8" or not enable_stream_k:
-            assert stream_k_selections[-1] == 0
+        assert (stream_k_selections[-1] > 0) == expected_stream_k
         torch.cuda.synchronize()
         _check_output(result, expected, dtype)
         # Uniform attention exposes off-by-one causal boundaries in LSE.
@@ -893,7 +921,8 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
         torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=1e-5)
         assert torch.all(storage[:512] == 123) and torch.all(storage[-512:] == 123)
         print(
-            f"Packed Q verified: {case.name} dtype={dtype} packed={expected_packed}",
+            f"Packed Q verified: {case.name} dtype={dtype} packed={expected_packed} "
+            f"balanced_groups={stream_k_selections[-1]} workspace={workspace_capacity}",
             flush=True,
         )
 

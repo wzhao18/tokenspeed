@@ -297,6 +297,15 @@ def test_explicit_scheduling_policy_rejects_invalid_inputs(schedule, minimum):
             192**-0.5,
             schedule=schedule,
             split_kv_min_splits=minimum,
+            output_scale=1.0,
+            is_var_seq=True,
+            causal_mask=True,
+            window_left=-1,
+            enable_pdl=False,
+            return_lse=False,
+            cp_world=1,
+            cp_rank=0,
+            cp_interleave_size=1,
         )
 
 
@@ -740,16 +749,15 @@ def _check_decode_gpu(case, variable_kv, dtype, partial_fp16, min_split_kv):
     _check_output(out[indices], expected, dtype)
 
 
-def _decode_with_schedule(*, enable_stream_k, **kwargs):
+def _decode_with_schedule(*, enable_stream_k, min_split_kv, **kwargs):
     """Numerically exercise the legacy API or the explicit balanced policy."""
     import tokenspeed_mla.mla_decode as decode
 
     if enable_stream_k:
-        floor = kwargs.pop("min_split_kv", 1)
         return decode.tokenspeed_mla_decode_with_schedule(
-            **kwargs, schedule="balanced", split_kv_min_splits=floor
+            **kwargs, schedule="balanced", split_kv_min_splits=min_split_kv
         )
-    return decode.tokenspeed_mla_decode(**kwargs)
+    return decode.tokenspeed_mla_decode(**kwargs, min_split_kv=min_split_kv)
 
 
 def _check_packed_gpu(enable_stream_k, partial_fp16=False):
@@ -839,11 +847,18 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
             seq_lens=lengths,
             max_seq_len=case.kv_len,
             softmax_scale=192**-0.5,
+            output_scale=1.0,
             is_var_seq=variable_kv,
+            causal_mask=True,
+            window_left=-1,
             enable_pdl=pdl,
             out=out,
             return_lse=True,
             enable_stream_k=enable_stream_k,
+            min_split_kv=1,
+            cp_world=1,
+            cp_rank=0,
+            cp_interleave_size=1,
         )
         result, lse = _decode_with_schedule(**kwargs)
         assert selections[-1] is expected_packed
@@ -941,12 +956,17 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
                     seq_lens=lengths,
                     max_seq_len=case.kv_len,
                     softmax_scale=192**-0.5,
+                    output_scale=1.0,
                     is_var_seq=True,
                     causal_mask=causal,
                     window_left=window,
                     enable_pdl=True,
                     return_lse=True,
                     enable_stream_k=enable_stream_k,
+                    min_split_kv=1,
+                    cp_world=1,
+                    cp_rank=0,
+                    cp_interleave_size=1,
                 )
                 result, lse = tokenspeed_mla_decode(**kwargs)
                 assert stream_k_selections[-1] == 0
@@ -1009,14 +1029,18 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
             ),
             max_seq_len=local_kv.shape[0],
             softmax_scale=192**-0.5,
+            output_scale=1.0,
             is_var_seq=False,
             causal_mask=True,
+            window_left=-1,
+            enable_pdl=False,
             cp_world=world,
             cp_rank=rank,
             cp_interleave_size=interleave,
             causal_seqs=torch.tensor([length], device="cuda", dtype=torch.int32),
             return_lse=True,
             enable_stream_k=enable_stream_k,
+            min_split_kv=1,
         )
         output, lse = tokenspeed_mla_decode(**kwargs)
         assert (stream_k_selections[-1] > 0) == enable_stream_k
@@ -1156,9 +1180,17 @@ def _check_stream_k_zero_lengths_gpu(partial_fp16):
         max_seq_len=385,
         softmax_scale=192**-0.5,
         output_scale=0.37,
+        is_var_seq=True,
+        causal_mask=True,
+        window_left=-1,
+        enable_pdl=False,
+        cp_world=1,
+        cp_rank=0,
+        cp_interleave_size=1,
         out=out,
         return_lse=True,
         enable_stream_k=True,
+        min_split_kv=1,
     )
     plan = decode._get_stream_k_plan(
         4, 4, 512, decode.get_max_active_clusters(2), workspace.numel(), 4
@@ -1663,10 +1695,17 @@ def _check_local_visible_gpu(
         seq_lens=lengths,
         max_seq_len=case.kv_len,
         softmax_scale=192**-0.5,
+        output_scale=1.0,
         out=out,
         is_var_seq=not persistent,
         causal_mask=True,
+        window_left=-1,
+        enable_pdl=False,
+        cp_world=1,
+        cp_rank=0,
+        cp_interleave_size=1,
         enable_stream_k=True,
+        min_split_kv=1,
         return_lse=True,
         local_visible_lens=visible,
     )

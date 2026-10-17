@@ -109,12 +109,32 @@ Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
 
 FP8 causal decode can opt in to length-balanced persistent scheduling with
-`tokenspeed_mla_decode_with_schedule(..., schedule="balanced", split_kv_min_splits=8)`.
+`tokenspeed_mla_decode_with_schedule`:
+
+```python
+tokenspeed_mla_decode_with_schedule(
+    ...,
+    schedule="balanced",
+    split_kv_min_splits=8,
+    output_scale=1.0,
+    is_var_seq=True,
+    causal_mask=True,
+    window_left=-1,
+    enable_pdl=False,
+    return_lse=False,
+    cp_world=1,
+    cp_rank=0,
+    cp_interleave_size=1,
+)
+```
+
+The new entrypoint requires explicit scheduling, masking, PDL, output and
+context-parallel choices. Optional tensor buffers and metadata may be omitted.
 This partitions the
 concatenated KV tiles across persistent CTA groups instead of assigning the
 same split count to every request. It can help batches with uneven KV lengths;
 it is not uniformly faster. The existing `tokenspeed_mla_decode` API remains
-split-KV; the new entrypoint requires an explicit scheduling policy.
+split-KV and preserves its existing defaults.
 
 Stream-K uses the existing packed-M128 attention kernel, masks and reducer on
 SM100/SM103. Other query layouts, batches above 128 requests, sliding windows,

@@ -843,20 +843,20 @@ def tokenspeed_mla_decode_with_schedule(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     softmax_scale: float,
-    output_scale: float = 1.0,
-    out: Optional[torch.Tensor] = None,
-    is_var_seq: bool = True,
-    causal_mask: bool = True,
-    window_left: int = -1,
-    enable_pdl: bool = False,
-    return_lse: bool = False,
-    causal_seqs: Optional[torch.Tensor] = None,
-    cp_world: int = 1,
-    cp_rank: int = 0,
-    cp_interleave_size: int = 1,
     *,
     schedule: Literal["split-kv", "balanced"],
     split_kv_min_splits: int,
+    output_scale: float,
+    is_var_seq: bool,
+    causal_mask: bool,
+    window_left: int,
+    enable_pdl: bool,
+    return_lse: bool,
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave_size: int,
+    out: Optional[torch.Tensor] = None,
+    causal_seqs: Optional[torch.Tensor] = None,
     local_visible_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
@@ -909,7 +909,7 @@ def tokenspeed_mla_decode_with_schedule(
         Whether to enable causal masking in the CuTe DSL kernel.
         Supported by both the FP8 and FP16/BF16 kernel paths.
     window_left : int
-        Sliding-window span, or -1 (default) for full history. When
+        Sliding-window span, or -1 for full history. When
         non-negative, query row ``i`` of the ``q_len`` block attends to keys
         ``[max(0, K - q_len - window_left + i), k_bound)`` -- the whole block
         plus ``window_left`` tokens of history, which is the mask a block
@@ -930,7 +930,7 @@ def tokenspeed_mla_decode_with_schedule(
         Decode-context-parallel (DCP) support. When True, also return the
         per-(B, q_len, head) log-sum-exp so callers can merge the partial
         attention each rank computes over its KV slice into the full result.
-        Default False keeps the original single-tensor return and emits no
+        False keeps the original single-tensor return and emits no
         LSE code in the compiled kernel.
     causal_seqs : Optional[torch.Tensor]
         DCP support. Per-request *global* causal bound [B] (int32) -- the full
@@ -939,7 +939,7 @@ def tokenspeed_mla_decode_with_schedule(
         ``cp_interleave_size``. Required when ``cp_world > 1``. ``None``
         (default, non-DCP) uses the local ``seq_lens``.
     cp_world : int
-        DCP world size. ``1`` (default) is the non-DCP path and compiles to the
+        DCP world size. ``1`` is the non-DCP path and compiles to the
         original masking with no extra work. ``>1`` enables DCP
         global-coordinate causal masking (``causal_seqs`` is then required).
     cp_rank : int

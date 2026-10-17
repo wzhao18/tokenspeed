@@ -108,6 +108,23 @@ The wrapper keeps tiling, workspace sizing and kernel selection consistent.
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
 
+FP8 causal decode can opt in to length-balanced persistent scheduling with
+`tokenspeed_mla_decode_with_schedule(..., schedule="balanced", split_kv_min_splits=8)`.
+This partitions the
+concatenated KV tiles across persistent CTA groups instead of assigning the
+same split count to every request. It can help batches with uneven KV lengths;
+it is not uniformly faster. The existing `tokenspeed_mla_decode` API remains
+split-KV; the new entrypoint requires an explicit scheduling policy.
+
+Stream-K uses the existing packed-M128 attention kernel, masks and reducer on
+SM100/SM103. Other query layouts, batches above 128 requests, sliding windows,
+explicit local visibility, and insufficient workspace retain the existing
+path. `split_kv_min_splits` governs split-KV execution and fallback, not
+stream-K's segment count. The legacy API's `min_split_kv` keeps its original
+per-request floor under the fixed split-KV policy.
+No host read of sequence lengths or additional planning kernel is required;
+lengths may change in place between CUDA-graph replays.
+
 Regression coverage is in [tests/test_mla_decode.py](tests/test_mla_decode.py).
 It checks packed-query geometry, split-KV workspace sizing, FP8/FP16/BF16
 outputs and LSE, reducer variants, CUDA-graph replay, sliding windows and DCP.

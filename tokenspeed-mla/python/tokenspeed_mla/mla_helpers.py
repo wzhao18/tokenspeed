@@ -355,6 +355,188 @@ def create_mla_static_tile_scheduler(
     return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
 
 
+# A warp scans four requests per lane and reduces at most one segment per lane.
+STREAM_K_MAX_GROUPS = 32
+STREAM_K_REQUESTS_PER_LANE = 4
+STREAM_K_MAX_BATCH = 32 * STREAM_K_REQUESTS_PER_LANE
+
+
+def _stream_k_ge(a, b):
+    return cutlass.min(cutlass.max(a - b + 1, cutlass.Int32(0)), cutlass.Int32(1))
+
+
+def _stream_k_uniform(x):
+    # Warp scans produce lane values, but TMA indices and pipeline loops must
+    # remain warp-uniform across successive request segments.
+    return cute.arch.make_warp_uniform(x)
+
+
+def _stream_k_tiles(length, tile: int):
+    return length // tile + cutlass.Int32(length % tile != 0)
+
+
+def _stream_k_group(position, groups, total, use_int32: bool):
+    if cutlass.const_expr(use_int32):
+        return ((position + 1) * groups - 1) // total
+    return cutlass.Int32(((cutlass.Int64(position) + 1) * groups - 1) // total)
+
+
+def stream_k_request_segments(
+    cache_seqs, batch, request, tile: int, groups: int, use_int32: bool
+):
+    """Return the first group and segment count of a request, warp-cooperatively."""
+    lane = cute.arch.lane_idx()
+    total = cutlass.Int32(0)
+    before = cutlass.Int32(0)
+    for j in range(STREAM_K_REQUESTS_PER_LANE):
+        index = lane * STREAM_K_REQUESTS_PER_LANE + j
+        count = _stream_k_tiles(cache_seqs[cutlass.min(index, batch - 1)], tile)
+        count = count * _stream_k_ge(batch - 1, index)
+        total = total + count
+        before = before + count * _stream_k_ge(request - 1, index)
+    total = _stream_k_uniform(cute.arch.warp_reduction_sum(total))
+    before = _stream_k_uniform(cute.arch.warp_reduction_sum(before))
+    count = _stream_k_tiles(cache_seqs[request], tile)
+    active = cutlass.max(cutlass.min(cutlass.Int32(groups), total), cutlass.Int32(1))
+    total = cutlass.max(total, cutlass.Int32(1))
+    first = _stream_k_group(before, active, total, use_int32)
+    last = _stream_k_group(before + count - 1, active, total, use_int32)
+    segments = (last - first + 1) * _stream_k_ge(count, cutlass.Int32(1))
+    return _stream_k_uniform(first), _stream_k_uniform(segments)
+
+
+class MLAStreamKTileScheduler:
+    """Partition concatenated request K tiles into equal persistent ranges.
+
+    A group may intersect several requests. Segment (request, group) stores
+    its partial at slot ``request + group``; intersecting segments have unique
+    slots because request and group indices both increase. Split/batch storage
+    coordinates are ``divmod(slot, batch)``. Each warp independently walks the
+    same ranges, retaining the existing pipeline states across segments.
+    """
+
+    def __init__(self, cache_seqs, constants: tuple, request, before, tile: int):
+        self.cache_seqs = cache_seqs
+        self.constants = constants
+        self.request = request
+        self.before = before
+        self.tile = tile
+
+    def _current_tiles(self):
+        batch = self.constants[0]
+        return _stream_k_uniform(
+            _stream_k_tiles(
+                self.cache_seqs[cutlass.min(self.request, batch - 1)], self.tile
+            )
+        )
+
+    def get_current_work(self, *, loc=None, ip=None):
+        batch, cta, query, group, active, start, end = self.constants
+        count = self._current_tiles()
+        lo = cutlass.max(start, self.before)
+        hi = cutlass.min(end, self.before + count)
+        slot = self.request + group
+        split = slot // batch
+        valid = (
+            _stream_k_ge(active - 1, group)
+            * _stream_k_ge(batch - 1, self.request)
+            * _stream_k_ge(end - 1, self.before)
+        )
+        coordinates = (
+            cta,
+            query,
+            _stream_k_uniform(cutlass.min(self.request, batch - 1)),
+            _stream_k_uniform(split),
+            _stream_k_uniform(lo - self.before),
+            _stream_k_uniform(cutlass.max(hi - lo, cutlass.Int32(0))),
+            _stream_k_uniform(slot - split * batch),
+        )
+        return WorkTileInfo(coordinates, _stream_k_uniform(valid) > 0)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
+        self.before = self.before + self._current_tiles()
+        self.request = self.request + 1
+
+    def __extract_mlir_values__(self):
+        return cutlass.extract_mlir_values(self.request) + cutlass.extract_mlir_values(
+            self.before
+        )
+
+    def __new_from_mlir_values__(self, values):
+        assert len(values) == 2
+        return MLAStreamKTileScheduler(
+            self.cache_seqs,
+            self.constants,
+            cutlass.new_from_mlir_values(self.request, values[:1]),
+            cutlass.new_from_mlir_values(self.before, values[1:]),
+            self.tile,
+        )
+
+
+def create_mla_stream_k_tile_scheduler(
+    cache_seqs,
+    batch,
+    tile: int,
+    queries: int,
+    groups: int,
+    cluster_size: int,
+    use_int32: bool,
+):
+    """Build a warp-uniform scheduler; all lanes must call this together."""
+    block, _, _ = cute.arch.block_idx()
+    cta = block % cluster_size
+    cluster = block // cluster_size
+    query = cluster % queries
+    group = cluster // queries
+    lane = cute.arch.lane_idx()
+    counts = []
+    for j in range(STREAM_K_REQUESTS_PER_LANE):
+        index = lane * STREAM_K_REQUESTS_PER_LANE + j
+        counts.append(
+            _stream_k_tiles(cache_seqs[cutlass.min(index, batch - 1)], tile)
+            * _stream_k_ge(batch - 1, index)
+        )
+    lane_sum = counts[0]
+    for j in range(1, STREAM_K_REQUESTS_PER_LANE):
+        lane_sum = lane_sum + counts[j]
+    prefix = lane_sum
+    for offset in (1, 2, 4, 8, 16):
+        previous = cute.arch.shuffle_sync(
+            prefix, offset=cutlass.max(lane - offset, cutlass.Int32(0))
+        )
+        prefix = prefix + previous * _stream_k_ge(lane, cutlass.Int32(offset))
+    total = _stream_k_uniform(cute.arch.shuffle_sync(prefix, offset=31))
+    active = cutlass.min(cutlass.Int32(groups), total)
+    divisor = cutlass.max(active, cutlass.Int32(1))
+    if cutlass.const_expr(use_int32):
+        start = _stream_k_uniform(group * total // divisor)
+        end = _stream_k_uniform((group + 1) * total // divisor)
+    else:
+        start = _stream_k_uniform(
+            cutlass.Int32(cutlass.Int64(group) * total // divisor)
+        )
+        end = _stream_k_uniform(
+            cutlass.Int32((cutlass.Int64(group) + 1) * total // divisor)
+        )
+    prefix = prefix - lane_sum
+    preceding_requests = cutlass.Int32(0)
+    preceding_tiles = cutlass.Int32(0)
+    for j in range(STREAM_K_REQUESTS_PER_LANE):
+        index = lane * STREAM_K_REQUESTS_PER_LANE + j
+        prefix = prefix + counts[j]
+        before = _stream_k_ge(start, prefix) * _stream_k_ge(batch - 1, index)
+        preceding_requests = preceding_requests + before
+        preceding_tiles = preceding_tiles + counts[j] * before
+    first = _stream_k_uniform(cute.arch.warp_reduction_sum(preceding_requests))
+    before = _stream_k_uniform(cute.arch.warp_reduction_sum(preceding_tiles))
+    return MLAStreamKTileScheduler(
+        cache_seqs, (batch, cta, query, group, active, start, end), first, before, tile
+    )
+
+
 LOG2_E = 1.4426950408889634074
 # avoid register indexing on array.
 MAX_SPLITS = 256

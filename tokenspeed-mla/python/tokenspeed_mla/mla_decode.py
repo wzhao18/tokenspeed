@@ -28,7 +28,7 @@ and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 
 import functools
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -42,6 +42,8 @@ from tokenspeed_mla.mla_decode_fp8_sm107 import (
 from tokenspeed_mla.mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from tokenspeed_mla.mla_helpers import (
     MAX_SPLITS,
+    STREAM_K_MAX_BATCH,
+    STREAM_K_MAX_GROUPS,
     ceil_div,
     compute_q_tile_layout,
     get_mla_decode_arch,
@@ -137,6 +139,40 @@ def _get_split_kv_and_workspace_size(
     return split_kv, workspace_size
 
 
+def _get_stream_k_plan(
+    batch: int,
+    query_tiles: int,
+    kv_lora_rank: int,
+    max_active_clusters: int,
+    workspace_capacity: int,
+    max_k_tiles: int,
+) -> Optional[Tuple[int, int, int]]:
+    """Return groups, workspace split slots and bytes, or retain split-KV.
+
+    Segment (request, group) uses slot ``request + group``. At most
+    ``batch + groups - 1`` such slots are needed, using the existing packed
+    workspace layout. The launch does not read lengths back to the host.
+    """
+    if not 0 < batch <= STREAM_K_MAX_BATCH or query_tiles <= 0:
+        return None
+    # Prefix scans stay Int32; only the partition products need Int64.
+    if batch * max_k_tiles >= 1 << 31:
+        return None
+    groups = max_active_clusters // query_tiles
+    if not 2 <= groups <= STREAM_K_MAX_GROUPS:
+        return None
+    slots = ceil_div(batch + groups - 1, batch)
+    workspace = batch * 128 * query_tiles * slots * (kv_lora_rank + 1) * 4
+    if workspace > workspace_capacity or workspace >= 1 << 31:
+        return None
+    return groups, slots, workspace
+
+
+def _stream_k_int32_safe(batch: int, max_k_tiles: int, groups: int) -> bool:
+    """Prove every partition numerator fits without reading device lengths."""
+    return (batch * max_k_tiles + 1) * groups < 1 << 31
+
+
 @functools.cache
 def _check_can_implement(
     torch_dtype: torch.dtype,
@@ -218,6 +254,8 @@ def _get_compiled_mla_kernel(
     pack_q: bool = False,
     *,
     partial_fp16: bool,
+    stream_k_groups: int,
+    stream_k_int32: bool,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -275,6 +313,8 @@ def _get_compiled_mla_kernel(
         kernel_kwargs["reducer_d_tiles"] = reducer_d_tiles
         kernel_kwargs["reducer_max_splits"] = reducer_max_splits
         kernel_kwargs["partial_fp16"] = partial_fp16
+        kernel_kwargs["stream_k_groups"] = stream_k_groups
+        kernel_kwargs["stream_k_int32"] = stream_k_int32
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -759,6 +799,66 @@ def tokenspeed_mla_decode(
     min_split_kv: int = 1,
     local_visible_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Decode with the existing split-KV scheduling policy.
+
+    ``min_split_kv`` retains its per-request split floor. Tensor layouts,
+    masking and other arguments are described in
+    :func:`tokenspeed_mla_decode_with_schedule`; this entrypoint fixes
+    ``schedule="split-kv"`` and forwards the floor as ``split_kv_min_splits``.
+    """
+    return tokenspeed_mla_decode_with_schedule(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+        out=out,
+        is_var_seq=is_var_seq,
+        causal_mask=causal_mask,
+        window_left=window_left,
+        enable_pdl=enable_pdl,
+        return_lse=return_lse,
+        causal_seqs=causal_seqs,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        cp_interleave_size=cp_interleave_size,
+        schedule="split-kv",
+        split_kv_min_splits=min_split_kv,
+        local_visible_lens=local_visible_lens,
+    )
+
+
+def tokenspeed_mla_decode_with_schedule(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    output_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    is_var_seq: bool = True,
+    causal_mask: bool = True,
+    window_left: int = -1,
+    enable_pdl: bool = False,
+    return_lse: bool = False,
+    causal_seqs: Optional[torch.Tensor] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    cp_interleave_size: int = 1,
+    *,
+    schedule: Literal["split-kv", "balanced"],
+    split_kv_min_splits: int,
+    local_visible_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
     M128 kernels pack adjacent query/head rows when this uses fewer tiles than
@@ -849,10 +949,10 @@ def tokenspeed_mla_decode(
         Number of consecutive global KV positions assigned to each DCP rank
         before ownership advances to the next rank. ``1`` is token-striped DCP;
         values greater than one are block-interleaved DCP.
-    min_split_kv : int
-        Minimum number of KV splits used by the decode kernel, in [1, 256].
-        The effective value is capped to avoid creating empty partitions.
-        Defaults to 1, which enables automatic split selection.
+    split_kv_min_splits : int
+        Per-request split floor for split-KV execution, in [1, 256], capped
+        to avoid empty partitions. This also governs the balanced policy's
+        split-KV fallback; it does not constrain balanced partitioning.
 
     local_visible_lens : torch.Tensor, optional
         Contiguous int32 [B, q_len] tensor on the query device, supported with
@@ -868,14 +968,26 @@ def tokenspeed_mla_decode(
         belong to the caller. Cannot be combined with sliding windows or
         interleaved CP metadata.
 
+    schedule : {"split-kv", "balanced"}
+        Explicit scheduling policy. ``split-kv`` preserves the existing path.
+        ``balanced`` partitions concatenated request KV tiles across persistent
+        groups for packed M128 FP8 causal decode on SM100/SM103, with at most
+        128 requests and 2-32 groups. Other layouts, sliding windows, explicit
+        local visibility, unsafe Int32 prefix bounds and insufficient workspace
+        use split-KV with ``split_kv_min_splits``. Thus balanced is a policy,
+        not a guarantee that every call runs stream-K.
+
     Returns
     -------
     torch.Tensor or tuple[torch.Tensor, torch.Tensor]
         Output tensor [B, q_len, H, kv_lora_rank]. When ``return_lse=True``,
         returns ``(output, lse)`` with ``lse`` of shape [B, q_len, H] (fp32).
     """
+    if schedule not in ("split-kv", "balanced"):
+        raise ValueError("schedule must be 'split-kv' or 'balanced'")
+    min_split_kv = split_kv_min_splits
     if type(min_split_kv) is not int or not 1 <= min_split_kv <= 256:
-        raise ValueError("min_split_kv must be an integer in [1, 256]")
+        raise ValueError("The split-KV minimum must be an integer in [1, 256]")
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
@@ -1000,19 +1112,46 @@ def tokenspeed_mla_decode(
         H_eff = mma_m_tile
         fold_sq_factor = 1
 
-    # Cached split_kv and workspace_size computation
+    # Stream-K changes only work partitioning. Unsupported layouts retain the
+    # existing split-KV path, including its split-floor and masking semantics.
     max_active_blocks = get_num_sm(query.device)
-    split_kv, workspace_size = _get_split_kv_and_workspace_size(
-        B,
-        q_len_eff,
-        H_eff,
-        kv_lora_rank,
-        max_active_blocks,
-        max_seq_len,
-        q_dtype,
-        mma_qk_tiler_mn,
-        min_split_kv,
-    )
+    stream_k_plan = None
+    if (
+        schedule == "balanced"
+        and pack_q
+        and is_fp8
+        and causal_mask
+        and compute_capability in ((10, 0), (10, 3))
+        and window_left == -1
+        and local_visible_lens is None
+    ):
+        stream_k_plan = _get_stream_k_plan(
+            B,
+            q_len_eff,
+            kv_lora_rank,
+            get_max_active_clusters(2),
+            workspace_buffer.numel(),
+            ceil_div(max_seq_len, mma_qk_tiler_mn[1]),
+        )
+    stream_k_groups = 0
+    stream_k_int32 = False
+    if stream_k_plan is not None:
+        stream_k_groups, split_kv, workspace_size = stream_k_plan
+        stream_k_int32 = _stream_k_int32_safe(
+            B, ceil_div(max_seq_len, mma_qk_tiler_mn[1]), stream_k_groups
+        )
+    else:
+        split_kv, workspace_size = _get_split_kv_and_workspace_size(
+            B,
+            q_len_eff,
+            H_eff,
+            kv_lora_rank,
+            max_active_blocks,
+            max_seq_len,
+            q_dtype,
+            mma_qk_tiler_mn,
+            min_split_kv,
+        )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -1136,10 +1275,14 @@ def tokenspeed_mla_decode(
         ),
         # reducer capacity: the power of two covering split_kv, which already
         # includes min_split_kv (part of the compile cache key)
-        reducer_max_splits=_get_reducer_max_splits(split_kv) if is_fp8 else 256,
+        reducer_max_splits=(
+            _get_reducer_max_splits(stream_k_groups or split_kv) if is_fp8 else 256
+        ),
         pack_q=pack_q,
         has_local_visible_lens=local_visible_lens is not None,
         partial_fp16=_FP16_PARTIALS,
+        stream_k_groups=stream_k_groups,
+        stream_k_int32=stream_k_int32,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros

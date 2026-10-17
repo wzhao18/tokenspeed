@@ -221,6 +221,128 @@ def test_bf16_split_selection_is_unchanged():
     assert workspace == 96 * 32 * 513 * 4
 
 
+@pytest.mark.parametrize("batch,slots", [(1, 19), (4, 6), (8, 4), (64, 2), (128, 2)])
+def test_stream_k_workspace_covers_every_request_group_segment(batch, slots):
+    import tokenspeed_mla.mla_decode as decode
+
+    groups, split_slots, workspace = decode._get_stream_k_plan(
+        batch, 4, 512, 76, 512 * 1024**2, 128
+    )
+    assert groups == 19
+    assert split_slots == slots
+    assert workspace == batch * 128 * 4 * slots * 513 * 4
+    assert decode._get_stream_k_plan(batch, 4, 512, 76, workspace, 128) is not None
+    assert decode._get_stream_k_plan(batch, 4, 512, 76, workspace - 1, 128) is None
+    # The final possible segment must fit even when it wraps a batch axis.
+    assert (batch - 1 + groups - 1) // batch < slots
+
+
+@pytest.mark.parametrize(
+    "batch,tiles,clusters,capacity",
+    [
+        (0, 4, 76, 1 << 30),
+        (129, 4, 76, 1 << 30),
+        (4, 4, 4, 1 << 30),
+        (4, 1, 76, 1 << 30),
+        (4, 4, 76, 1024),
+    ],
+)
+def test_stream_k_retains_split_kv_when_plan_cannot_fit(
+    batch, tiles, clusters, capacity
+):
+    import tokenspeed_mla.mla_decode as decode
+
+    assert decode._get_stream_k_plan(batch, tiles, 512, clusters, capacity, 128) is None
+
+
+@pytest.mark.parametrize(
+    "batch,max_tiles,fits",
+    [(127, 1 << 24, True), (128, (1 << 24) - 1, True), (128, 1 << 24, False)],
+)
+def test_stream_k_prefix_bound(batch, max_tiles, fits):
+    import tokenspeed_mla.mla_decode as decode
+
+    plan = decode._get_stream_k_plan(batch, 4, 512, 76, 512 * 1024**2, max_tiles)
+    assert (plan is not None) == fits
+
+
+@pytest.mark.parametrize("groups", [2, 19, 32])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_stream_k_int32_partition_bound(groups, offset):
+    import tokenspeed_mla.mla_decode as decode
+
+    # At batch=1 this is the exact final safe bound for the numerator.
+    max_tiles = ((1 << 31) - 1) // groups - 1 + offset
+    assert decode._stream_k_int32_safe(1, max_tiles, groups) == (offset <= 0)
+
+
+@pytest.mark.parametrize(
+    "schedule,minimum",
+    [("invalid", 1), ("balanced", 0), ("split-kv", 257), ("balanced", True)],
+)
+def test_explicit_scheduling_policy_rejects_invalid_inputs(schedule, minimum):
+    from tokenspeed_mla import tokenspeed_mla_decode_with_schedule
+
+    q, kv, tables, lengths = _make_inputs(_Case(1, 64, 64, 1), "bf16", False, "cpu")
+    with pytest.raises(ValueError):
+        tokenspeed_mla_decode_with_schedule(
+            q,
+            kv,
+            torch.empty(0, dtype=torch.int8),
+            512,
+            64,
+            tables,
+            lengths,
+            64,
+            192**-0.5,
+            schedule=schedule,
+            split_kv_min_splits=minimum,
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"is_var_split_kv": True},
+        {"is_causal": False},
+        {"window_left": 4},
+        {"compute_capability": (10, 7)},
+    ],
+)
+def test_stream_k_kernel_rejects_unsupported_configuration(override):
+    import cutlass
+    from tokenspeed_mla.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
+    from tokenspeed_mla.mla_helpers import select_mla_decode_tilers
+
+    qk, pv = select_mla_decode_tilers(96, 5, is_fp8=True, compute_capability=(10, 3))
+    kwargs = dict(
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        mma_qk_tiler_mn=qk,
+        mma_pv_tiler_mn=pv,
+        max_active_clusters=76,
+        page_size=64,
+        skip_correction_threshold=8.0,
+        is_persistent=True,
+        is_var_seq=True,
+        is_var_split_kv=False,
+        compute_capability=(10, 3),
+        is_causal=True,
+        num_heads=96,
+        seq_len_q=5,
+        pack_q=True,
+        window_left=-1,
+        reducer_max_splits=32,
+        partial_fp16=False,
+        stream_k_groups=19,
+        stream_k_int32=True,
+    )
+    with pytest.raises(ValueError, match="Stream-K requires"):
+        BlackwellMultiHeadLatentAttentionForwardFP8(**dict(kwargs, **override))
+
+
 @pytest.mark.parametrize("dtype", ["fp8", "bf16"])
 def test_input_pages_are_unique_and_tma_aligned(dtype):
     case = _Case(4, 129, 12, 8)
@@ -433,26 +555,29 @@ def test_fp8_output_requires_sm107():
 class TestCompile:
     @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
     @pytest.mark.parametrize(
-        "dtype,heads,local_visible",
+        "dtype,heads,local_visible,stream_k_groups",
         [
-            ("float8_e4m3fn", 16, False),
-            ("float8_e4m3fn", 96, False),
-            ("float8_e4m3fn", 16, True),
-            ("float8_e4m3fn", 96, True),
-            ("bfloat16", 16, False),
-            ("bfloat16", 16, True),
+            ("float8_e4m3fn", 16, False, 0),
+            ("float8_e4m3fn", 96, False, 0),
+            ("float8_e4m3fn", 16, True, 0),
+            ("float8_e4m3fn", 96, True, 0),
+            ("bfloat16", 16, False, 0),
+            ("bfloat16", 16, True, 0),
+            pytest.param("float8_e4m3fn", 96, False, 19, id="stream-k"),
         ],
     )
     def test_decode_architectures_and_causal_masks(
-        self, capability, dtype, heads, local_visible
+        self, capability, dtype, heads, local_visible, stream_k_groups
     ):
+        if stream_k_groups and capability == (10, 7):
+            pytest.skip("Stream-K retains the existing SM107 scheduling path")
         # No device or host occupancy query is needed to compile another target.
         script = textwrap.dedent(f"""
             import torch
             import tokenspeed_mla.mla_decode as decode
 
             decode.get_max_active_clusters = lambda cluster_size: 1
-            for causal_mask in (False, True):
+            for causal_mask in {(True,) if stream_k_groups else (False, True)}:
                 compiled = decode._get_compiled_mla_kernel(
                     torch_dtype=torch.{dtype},
                     page_size=64,
@@ -469,6 +594,10 @@ class TestCompile:
                     num_heads={heads},
                     seq_len_q=4,
                     return_lse=True,
+                    pack_q={bool(stream_k_groups)!r},
+                    stream_k_groups={stream_k_groups},
+                    stream_k_int32={bool(stream_k_groups)!r},
+                    reducer_max_splits={32 if stream_k_groups else 256},
                 )
                 assert compiled is not None
             """)
@@ -611,17 +740,32 @@ def _check_decode_gpu(case, variable_kv, dtype, partial_fp16, min_split_kv):
     _check_output(out[indices], expected, dtype)
 
 
-def _check_packed_gpu():
+def _decode_with_schedule(*, enable_stream_k, **kwargs):
+    """Numerically exercise the legacy API or the explicit balanced policy."""
+    import tokenspeed_mla.mla_decode as decode
+
+    if enable_stream_k:
+        floor = kwargs.pop("min_split_kv", 1)
+        return decode.tokenspeed_mla_decode_with_schedule(
+            **kwargs, schedule="balanced", split_kv_min_splits=floor
+        )
+    return decode.tokenspeed_mla_decode(**kwargs)
+
+
+def _check_packed_gpu(enable_stream_k, partial_fp16=False):
     import tokenspeed_mla.mla_decode as decode
 
     torch.backends.cuda.matmul.allow_tf32 = False
+    decode._FP16_PARTIALS = partial_fp16
     workspace = torch.zeros(32 * 1024**2, dtype=torch.int8, device="cuda")
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     original_compile = decode._get_compiled_mla_kernel
     selections = []
+    stream_k_selections = []
 
     def record_compile(*args, **kwargs):
         selections.append(kwargs["pack_q"])
+        stream_k_selections.append(kwargs["stream_k_groups"])
         return original_compile(*args, **kwargs)
 
     decode._get_compiled_mla_kernel = record_compile
@@ -652,8 +796,19 @@ def _check_packed_gpu():
         (_Case(1, 129, 96, 4), "fp8", False, False, True, False),
         (_Case(1, 129, 96, 4), "fp16", False, False, True, False),
     ]
+    if partial_fp16:
+        # One long, uneven batch covers FP16 partials without duplicating the matrix.
+        cases = [row for row in cases if row[0] == _Case(8, 32768, 96, 4)]
     for case, dtype, variable_kv, pdl, token_gap, expected_packed in cases:
         q, kv, tables, lengths = _make_inputs(case, dtype, variable_kv, "cuda")
+        if case == _Case(8, 32768, 96, 4):
+            lengths.copy_(
+                torch.tensor(
+                    [max(case.q_len, case.kv_len >> i) for i in range(case.batch)],
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+            )
         if token_gap:
             storage = torch.empty(
                 (case.batch, case.q_len * 2, case.heads, 576),
@@ -688,9 +843,12 @@ def _check_packed_gpu():
             enable_pdl=pdl,
             out=out,
             return_lse=True,
+            enable_stream_k=enable_stream_k,
         )
-        result, lse = decode.tokenspeed_mla_decode(**kwargs)
+        result, lse = _decode_with_schedule(**kwargs)
         assert selections[-1] is expected_packed
+        if not expected_packed or dtype != "fp8" or not enable_stream_k:
+            assert stream_k_selections[-1] == 0
         torch.cuda.synchronize()
         _check_output(result, expected, dtype)
         # Uniform attention exposes off-by-one causal boundaries in LSE.
@@ -702,7 +860,7 @@ def _check_packed_gpu():
             + torch.arange(1, case.q_len + 1, device="cuda")[None, :]
         )
         expected_lse = visible.float().log2()[:, :, None].expand(-1, -1, case.heads)
-        result, lse = decode.tokenspeed_mla_decode(**kwargs)
+        result, lse = _decode_with_schedule(**kwargs)
         torch.cuda.synchronize()
         torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=1e-5)
         _check_output(result, expected, dtype)
@@ -710,7 +868,7 @@ def _check_packed_gpu():
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            result, lse = decode.tokenspeed_mla_decode(**kwargs)
+            result, lse = _decode_with_schedule(**kwargs)
         result.fill_(float("nan"))
         lse.fill_(float("nan"))
         for _ in range(3):
@@ -725,8 +883,19 @@ def _check_packed_gpu():
         )
 
 
-def _check_packed_masks_gpu(interleave):
-    from tokenspeed_mla import tokenspeed_mla_decode
+def _check_packed_masks_gpu(interleave, enable_stream_k):
+    import tokenspeed_mla.mla_decode as decode
+
+    tokenspeed_mla_decode = _decode_with_schedule
+
+    original_compile = decode._get_compiled_mla_kernel
+    stream_k_selections = []
+
+    def record_compile(*args, **kwargs):
+        stream_k_selections.append(kwargs["stream_k_groups"])
+        return original_compile(*args, **kwargs)
+
+    decode._get_compiled_mla_kernel = record_compile
 
     torch.backends.cuda.matmul.allow_tf32 = False
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
@@ -735,8 +904,9 @@ def _check_packed_masks_gpu(interleave):
     case = _Case(2, 769, 96, 5)
     for dtype in ("fp8", "fp16", "bf16"):
         q, kv, tables, lengths = _make_inputs(case, dtype, True, "cuda")
-        for window in (4, 256):
-            for causal in (False, True):
+        for window in (-1, 4, 256):
+            # Unwindowed noncausal attention must also retain split-KV.
+            for causal in ((False,) if window == -1 else (False, True)):
                 expected = torch.empty(
                     case.batch, case.q_len, case.heads, 512, device="cuda"
                 )
@@ -748,7 +918,11 @@ def _check_packed_masks_gpu(interleave):
                     length = int(lengths[batch])
                     keys = kv.float()[tables[batch].long()].reshape(-1, 576)
                     for row in range(case.q_len):
-                        low = max(0, length - case.q_len - window + row)
+                        low = (
+                            max(0, length - case.q_len - window + row)
+                            if window >= 0
+                            else 0
+                        )
                         high = length - case.q_len + row + 1 if causal else length
                         logits = q[batch, row].float() @ keys[low:high].T
                         logits *= 192**-0.5
@@ -772,8 +946,10 @@ def _check_packed_masks_gpu(interleave):
                     window_left=window,
                     enable_pdl=True,
                     return_lse=True,
+                    enable_stream_k=enable_stream_k,
                 )
                 result, lse = tokenspeed_mla_decode(**kwargs)
+                assert stream_k_selections[-1] == 0
                 _check_output(result, expected, dtype)
                 lse_tol = 0.05 if dtype == "fp8" else 0.002
                 torch.testing.assert_close(lse, expected_lse, atol=lse_tol, rtol=0.001)
@@ -840,8 +1016,10 @@ def _check_packed_masks_gpu(interleave):
             cp_interleave_size=interleave,
             causal_seqs=torch.tensor([length], device="cuda", dtype=torch.int32),
             return_lse=True,
+            enable_stream_k=enable_stream_k,
         )
         output, lse = tokenspeed_mla_decode(**kwargs)
+        assert (stream_k_selections[-1] > 0) == enable_stream_k
         _check_output(output, expected, "fp8")
         torch.testing.assert_close(lse, expected_lse, atol=0.05, rtol=0.001)
         _, lse = tokenspeed_mla_decode(
@@ -852,6 +1030,184 @@ def _check_packed_masks_gpu(interleave):
             f"DCP verified: rank={rank} world={world} interleave={interleave}",
             flush=True,
         )
+
+
+def _check_stream_k_partition_metadata_gpu(force_int64=False):
+    import cutlass
+    import cutlass.cute as cute
+    import tokenspeed_mla.mla_helpers as helpers
+    from cutlass.cute.runtime import from_dlpack
+    from tokenspeed_mla.mla_decode import _stream_k_int32_safe
+
+    @cute.kernel
+    def partition_kernel(
+        lengths,
+        records,
+        ranges,
+        tile: cutlass.Constexpr,
+        groups: cutlass.Constexpr,
+        use_int32: cutlass.Constexpr,
+    ):
+        block, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        batch = lengths.shape[0]
+        if block < batch:
+            first, count = helpers.stream_k_request_segments(
+                lengths, batch, block, tile, groups, use_int32
+            )
+            if lane == 0:
+                ranges[block, 0] = first
+                ranges[block, 1] = count
+        if block < groups:
+            scheduler = helpers.create_mla_stream_k_tile_scheduler(
+                lengths, batch, tile, 1, groups, 1, use_int32
+            )
+            work = scheduler.initial_work_tile_info()
+            while work.is_valid_tile:
+                coordinates = work.tile_idx
+                if lane == 0 and coordinates[5] > 0:
+                    records[block, coordinates[2], 0] = coordinates[4]
+                    records[block, coordinates[2], 1] = coordinates[5]
+                    records[block, coordinates[2], 2] = coordinates[3]
+                    records[block, coordinates[2], 3] = coordinates[6]
+                scheduler.advance_to_next_work()
+                work = scheduler.get_current_work()
+
+    @cute.jit
+    def launch(lengths, records, ranges, use_int32: cutlass.Constexpr):
+        partition_kernel(lengths, records, ranges, 128, 19, use_int32).launch(
+            grid=(max(lengths.shape[0], 19), 1, 1), block=(32, 1, 1)
+        )
+
+    # Near-Int32 sequence lengths need only metadata, not giant KV tensors.
+    for values in (
+        [2**31 - 1],
+        [2**31 - 1] * 127,
+        [2**31 - 128] * 128,
+        [2**31 - 1, 0] * 64,
+        [0] * 128,
+        [131072, 65536, 32768, 0],
+        [0, 128, 0, 257, 0],
+        [131072] * 128,
+    ):
+        batch, groups, tile = len(values), 19, 128
+        lengths = torch.tensor(values, dtype=torch.int32, device="cuda")
+        records = torch.full((groups, batch, 4), -1, dtype=torch.int32, device="cuda")
+        ranges = torch.empty(batch, 2, dtype=torch.int32, device="cuda")
+        use_int32 = not force_int64 and _stream_k_int32_safe(
+            batch, (max(values) + tile - 1) // tile, groups
+        )
+        compiled = cute.compile(
+            launch,
+            from_dlpack(lengths),
+            from_dlpack(records),
+            from_dlpack(ranges),
+            use_int32,
+            options="--enable-tvm-ffi",
+        )
+        compiled(lengths, records, ranges)
+        counts = [(length + tile - 1) // tile for length in values]
+        total = sum(counts)
+        active = min(groups, total)
+        expected = torch.full((groups, batch, 4), -1, dtype=torch.int32)
+        before = 0
+        for request, count in enumerate(counts):
+            for group in range(active):
+                low = max(before, group * total // active)
+                high = min(before + count, (group + 1) * total // active)
+                if low < high:
+                    expected[group, request] = torch.tensor(
+                        [
+                            low - before,
+                            high - low,
+                            (request + group) // batch,
+                            (request + group) % batch,
+                        ],
+                        dtype=torch.int32,
+                    )
+            before += count
+        torch.testing.assert_close(records.cpu(), expected, rtol=0, atol=0)
+        observed_ranges = ranges.cpu()
+        for request, count in enumerate(counts):
+            owners = (expected[:, request, 1] > 0).nonzero().flatten()
+            assert observed_ranges[request, 1] == len(owners)
+            if count:
+                assert observed_ranges[request, 0] == owners[0]
+
+
+def _check_stream_k_zero_lengths_gpu(partial_fp16):
+    import tokenspeed_mla.mla_decode as decode
+
+    decode._FP16_PARTIALS = partial_fp16
+    torch.backends.cuda.matmul.allow_tf32 = False
+    case = _Case(4, 385, 96, 5)
+    query, kv, tables, lengths = _make_inputs(case, "fp8", False, "cuda")
+    query.zero_()
+    workspace = torch.empty(64 * 1024**2, dtype=torch.int8, device="cuda")
+    out = torch.empty(4, 5, 96, 512, dtype=torch.bfloat16, device="cuda")
+    kwargs = dict(
+        query=query,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=tables,
+        seq_lens=lengths,
+        max_seq_len=385,
+        softmax_scale=192**-0.5,
+        output_scale=0.37,
+        out=out,
+        return_lse=True,
+        enable_stream_k=True,
+    )
+    plan = decode._get_stream_k_plan(
+        4, 4, 512, decode.get_max_active_clusters(2), workspace.numel(), 4
+    )
+    assert plan is not None
+    original_compile = decode._get_compiled_mla_kernel
+    stream_k_selections = []
+
+    def record_compile(*args, **kwargs):
+        stream_k_selections.append(kwargs["stream_k_groups"])
+        return original_compile(*args, **kwargs)
+
+    decode._get_compiled_mla_kernel = record_compile
+    # Both buffers fit ordinary split-KV; only the exact stream-K bound fits it.
+    expected = _reference_mla(query, kv, tables, lengths, list(range(4))) * 0.37
+    for capacity in (plan[2], plan[2] - 1):
+        result, _ = _decode_with_schedule(
+            **dict(kwargs, workspace_buffer=workspace[:capacity])
+        )
+        torch.cuda.synchronize()
+        _check_output(result, expected, "fp8")
+        assert (stream_k_selections[-1] > 0) == (capacity == plan[2])
+    lengths.copy_(torch.tensor([0, 5, 129, 385], device="cuda", dtype=torch.int32))
+    _decode_with_schedule(**kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result, lse = _decode_with_schedule(**kwargs)
+    for values in (
+        [0, 5, 129, 385],
+        [385, 0, 5, 129],
+        [385, 129, 5, 0],
+        [0, 0, 0, 0],
+        [385, 0, 5, 129],
+    ):
+        lengths.copy_(torch.tensor(values, device="cuda", dtype=torch.int32))
+        expected = _reference_mla(query, kv, tables, lengths, list(range(4))) * 0.37
+        visible = (
+            lengths[:, None] - 5 + torch.arange(1, 6, device="cuda")[None]
+        ).clamp_min(0)
+        expected_lse = visible.float().log2()[:, :, None].expand(-1, -1, 96)
+        workspace.fill_(127)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_output(result, expected, "fp8")
+        torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=1e-5)
+        assert torch.isfinite(result).all()
 
 
 def _check_reducer_variants(partial_fp16):
@@ -1276,7 +1632,8 @@ def _check_local_visible_gpu(
     batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
 ):
     import tokenspeed_mla.mla_decode as decode
-    from tokenspeed_mla import tokenspeed_mla_decode
+
+    tokenspeed_mla_decode = _decode_with_schedule
 
     decode._FP16_PARTIALS = partial_fp16
 
@@ -1285,6 +1642,7 @@ def _check_local_visible_gpu(
 
     def record_compile(*args, **kwargs):
         selections.append(kwargs["is_workspace_size_zero"])
+        assert kwargs["stream_k_groups"] == 0
         return original_compile(*args, **kwargs)
 
     decode._get_compiled_mla_kernel = record_compile
@@ -1308,6 +1666,7 @@ def _check_local_visible_gpu(
         out=out,
         is_var_seq=not persistent,
         causal_mask=True,
+        enable_stream_k=True,
         return_lse=True,
         local_visible_lens=visible,
     )
@@ -1382,6 +1741,13 @@ def _check_local_visible_gpu(
 
 
 class TestGPU:
+    def test_stream_k_partition_metadata_near_int32_limit(self):
+        _run_gpu_check(_check_stream_k_partition_metadata_gpu, (), 240)
+
+    @pytest.mark.parametrize("partial_fp16", [False, True])
+    def test_stream_k_zero_lengths_and_graph_metadata_updates(self, partial_fp16):
+        _run_gpu_check(_check_stream_k_zero_lengths_gpu, (partial_fp16,), 240)
+
     @pytest.mark.parametrize(
         "dtype,partial_fp16", [("bf16", False), ("fp8", False), ("fp8", True)]
     )
@@ -1456,12 +1822,22 @@ class TestGPU:
         # BF16 partials are always acc_dtype; the fp16 flag is FP8-only.
         _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16", False, 1), 180)
 
-    def test_packed_q_outputs_lse_tails_and_folded_paths(self):
-        _run_gpu_check(_check_packed_gpu, (), 600)
+    @pytest.mark.parametrize(
+        "enable_stream_k,partial_fp16", [(False, False), (True, False), (True, True)]
+    )
+    def test_packed_q_outputs_lse_tails_and_folded_paths(
+        self, enable_stream_k, partial_fp16
+    ):
+        _run_gpu_check(_check_packed_gpu, (enable_stream_k, partial_fp16), 600)
 
-    @pytest.mark.parametrize("interleave", [1, 64], ids=["strided", "block64"])
-    def test_packed_q_preserves_sliding_window_and_dcp_masks(self, interleave):
-        _run_gpu_check(_check_packed_masks_gpu, (interleave,), 600)
+    @pytest.mark.parametrize("enable_stream_k", [False, True])
+    @pytest.mark.parametrize(
+        "interleave", [1, 64, 896], ids=["strided", "block64", "block896"]
+    )
+    def test_packed_q_preserves_sliding_window_and_dcp_masks(
+        self, interleave, enable_stream_k
+    ):
+        _run_gpu_check(_check_packed_masks_gpu, (interleave, enable_stream_k), 600)
 
     @pytest.mark.parametrize("partial_fp16", [False, True])
     def test_reducer_bands_preserve_output_lse_and_pdl(self, partial_fp16):

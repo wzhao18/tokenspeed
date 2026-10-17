@@ -135,6 +135,9 @@ concatenated KV tiles across persistent CTA groups instead of assigning the
 same split count to every request. It can help batches with uneven KV lengths;
 it is not uniformly faster. The existing `tokenspeed_mla_decode` API remains
 split-KV and preserves its existing defaults.
+Direct split-KV launch integrations retain `_get_compiled_mla_kernel` without
+scheduling arguments. It shares the compile cache with the explicitly scheduled
+helper and does not change the compiled kernel's launch arguments.
 
 Stream-K uses the existing packed-M128 attention kernel, masks and reducer on
 SM100/SM103. Other query layouts, batches above 128 requests, sliding windows,

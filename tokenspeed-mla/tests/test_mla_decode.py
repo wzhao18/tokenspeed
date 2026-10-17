@@ -580,14 +580,25 @@ class TestCompile:
     ):
         if stream_k_groups and capability == (10, 7):
             pytest.skip("Stream-K retains the existing SM107 scheduling path")
+        compile_helper = (
+            "_get_compiled_mla_kernel_with_schedule"
+            if stream_k_groups
+            else "_get_compiled_mla_kernel"
+        )
+        schedule_kwargs = (
+            f"stream_k_groups={stream_k_groups}, stream_k_int32=True,"
+            if stream_k_groups
+            else ""
+        )
         # No device or host occupancy query is needed to compile another target.
+        # Split-KV callers keep the legacy compile API without scheduling inputs.
         script = textwrap.dedent(f"""
             import torch
             import tokenspeed_mla.mla_decode as decode
 
             decode.get_max_active_clusters = lambda cluster_size: 1
             for causal_mask in {(True,) if stream_k_groups else (False, True)}:
-                compiled = decode._get_compiled_mla_kernel(
+                compiled = decode.{compile_helper}(
                     torch_dtype=torch.{dtype},
                     page_size=64,
                     kv_lora_rank=512,
@@ -604,8 +615,7 @@ class TestCompile:
                     seq_len_q=4,
                     return_lse=True,
                     pack_q={bool(stream_k_groups)!r},
-                    stream_k_groups={stream_k_groups},
-                    stream_k_int32={bool(stream_k_groups)!r},
+                    {schedule_kwargs}
                     reducer_max_splits={32 if stream_k_groups else 256},
                 )
                 assert compiled is not None
@@ -769,7 +779,7 @@ def _check_packed_gpu(enable_stream_k, partial_fp16):
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     capability = torch.cuda.get_device_capability()
     max_clusters = decode.get_max_active_clusters(2)
-    original_compile = decode._get_compiled_mla_kernel
+    original_compile = decode._get_compiled_mla_kernel_with_schedule
     selections = []
     stream_k_selections = []
 
@@ -778,7 +788,7 @@ def _check_packed_gpu(enable_stream_k, partial_fp16):
         stream_k_selections.append(kwargs["stream_k_groups"])
         return original_compile(*args, **kwargs)
 
-    decode._get_compiled_mla_kernel = record_compile
+    decode._get_compiled_mla_kernel_with_schedule = record_compile
     cases = [
         # Cross-query masks straddle a K128 boundary, with split-KV.
         (_Case(1, 129, 96, 4), "fp8", False, False, False, True),
@@ -930,14 +940,14 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
 
     tokenspeed_mla_decode = _decode_with_schedule
 
-    original_compile = decode._get_compiled_mla_kernel
+    original_compile = decode._get_compiled_mla_kernel_with_schedule
     stream_k_selections = []
 
     def record_compile(*args, **kwargs):
         stream_k_selections.append(kwargs["stream_k_groups"])
         return original_compile(*args, **kwargs)
 
-    decode._get_compiled_mla_kernel = record_compile
+    decode._get_compiled_mla_kernel_with_schedule = record_compile
 
     torch.backends.cuda.matmul.allow_tf32 = False
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
@@ -1229,14 +1239,14 @@ def _check_stream_k_zero_lengths_gpu(partial_fp16):
         4, 4, 512, decode.get_max_active_clusters(2), workspace.numel(), 4
     )
     assert plan is not None
-    original_compile = decode._get_compiled_mla_kernel
+    original_compile = decode._get_compiled_mla_kernel_with_schedule
     stream_k_selections = []
 
     def record_compile(*args, **kwargs):
         stream_k_selections.append(kwargs["stream_k_groups"])
         return original_compile(*args, **kwargs)
 
-    decode._get_compiled_mla_kernel = record_compile
+    decode._get_compiled_mla_kernel_with_schedule = record_compile
     # Both buffers fit ordinary split-KV; only the exact stream-K bound fits it.
     expected = _reference_mla(query, kv, tables, lengths, list(range(4))) * 0.37
     for capacity in (plan[2], plan[2] - 1):
@@ -1281,7 +1291,7 @@ def _check_reducer_variants(partial_fp16):
     decode._FP16_PARTIALS = partial_fp16
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    original_compile = decode._get_compiled_mla_kernel
+    original_compile = decode._get_compiled_mla_kernel_with_schedule
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
     for case, capacity in [(_Case(1, 8192, 12, 4), 64), (_Case(1, 8192, 96, 1), 32)]:
         q, kv, tables, lengths = _make_inputs(case, "fp8", False, "cuda")
@@ -1309,7 +1319,7 @@ def _check_reducer_variants(partial_fp16):
                     kwargs.update(reducer_d_tiles=bands, reducer_max_splits=max_splits)
                     return original_compile(*args, **kwargs)
 
-                decode._get_compiled_mla_kernel = compile_variant
+                decode._get_compiled_mla_kernel_with_schedule = compile_variant
                 output, lse = decode.tokenspeed_mla_decode(
                     query=q,
                     kv_cache=kv,
@@ -1702,7 +1712,7 @@ def _check_local_visible_gpu(
 
     decode._FP16_PARTIALS = partial_fp16
 
-    original_compile = decode._get_compiled_mla_kernel
+    original_compile = decode._get_compiled_mla_kernel_with_schedule
     selections = []
 
     def record_compile(*args, **kwargs):
@@ -1710,7 +1720,7 @@ def _check_local_visible_gpu(
         assert kwargs["stream_k_groups"] == 0
         return original_compile(*args, **kwargs)
 
-    decode._get_compiled_mla_kernel = record_compile
+    decode._get_compiled_mla_kernel_with_schedule = record_compile
 
     torch.backends.cuda.matmul.allow_tf32 = False
     case = _Case(batch, kv_len, heads, q_len)

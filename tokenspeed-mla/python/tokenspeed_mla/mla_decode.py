@@ -226,8 +226,68 @@ def _check_can_implement(
         )
 
 
-@functools.cache
 def _get_compiled_mla_kernel(
+    torch_dtype: torch.dtype,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_persistent: bool,
+    is_var_seq: bool,
+    is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
+    has_local_visible_lens: bool,
+    skip_correction_threshold: float = 0.0,
+    is_workspace_size_zero: bool = False,
+    fold_sq_factor: int = 1,
+    causal_mask: bool = True,
+    num_heads: int = 128,
+    seq_len_q: int = 1,
+    window_left: int = -1,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    cp_interleave_size: int = 1,
+    use_pdl: bool = False,
+    return_lse: bool = False,
+    reducer_d_tiles: int = 1,
+    reducer_max_splits: int = 256,
+    pack_q: bool = False,
+    *,
+    partial_fp16: bool,
+) -> Callable:
+    """Compile split-KV for callers that own their launch buffers."""
+    return _get_compiled_mla_kernel_with_schedule(
+        torch_dtype=torch_dtype,
+        page_size=page_size,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
+        is_var_split_kv=is_var_split_kv,
+        compute_capability=compute_capability,
+        has_local_visible_lens=has_local_visible_lens,
+        skip_correction_threshold=skip_correction_threshold,
+        is_workspace_size_zero=is_workspace_size_zero,
+        fold_sq_factor=fold_sq_factor,
+        causal_mask=causal_mask,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        window_left=window_left,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        cp_interleave_size=cp_interleave_size,
+        use_pdl=use_pdl,
+        return_lse=return_lse,
+        reducer_d_tiles=reducer_d_tiles,
+        reducer_max_splits=reducer_max_splits,
+        pack_q=pack_q,
+        partial_fp16=partial_fp16,
+        stream_k_groups=0,
+        stream_k_int32=False,
+    )
+
+
+@functools.cache
+def _get_compiled_mla_kernel_with_schedule(
     torch_dtype: torch.dtype,
     page_size: int,
     kv_lora_rank: int,
@@ -1247,7 +1307,7 @@ def tokenspeed_mla_decode_with_schedule(
     # Get compiled kernel (cached after first compile)
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
-    compiled_kernel = _get_compiled_mla_kernel(
+    compiled_kernel = _get_compiled_mla_kernel_with_schedule(
         torch_dtype=q_dtype,
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,

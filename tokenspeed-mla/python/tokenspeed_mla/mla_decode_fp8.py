@@ -269,7 +269,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param partial_fp16: Store split-KV partials as fp16 instead of acc_dtype
         :type partial_fp16: bool
         :param stream_k_groups: Zero selects split-KV; 2-32 selects the balanced
-            persistent grid instead of the split-KV grid.
+            persistent grid instead of the split-KV grid. Raw callers must ensure
+            at most 128 requests and an Int32-safe sum of KV tile counts, as
+            checked by the public wrapper.
         :type stream_k_groups: int
         :param stream_k_int32: Whether the caller proved that partition products
             fit Int32. False uses Int64 intermediates.

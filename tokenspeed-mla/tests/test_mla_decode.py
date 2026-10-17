@@ -760,7 +760,7 @@ def _decode_with_schedule(*, enable_stream_k, min_split_kv, **kwargs):
     return decode.tokenspeed_mla_decode(**kwargs, min_split_kv=min_split_kv)
 
 
-def _check_packed_gpu(enable_stream_k, partial_fp16=False):
+def _check_packed_gpu(enable_stream_k, partial_fp16):
     import tokenspeed_mla.mla_decode as decode
 
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -817,8 +817,6 @@ def _check_packed_gpu(enable_stream_k, partial_fp16=False):
             enable_stream_k
             and dtype == "fp8"
             and expected_packed
-            and case.heads == 96
-            and case.q_len in (4, 5, 8)
             and capability in ((10, 0), (10, 3))
             and 2 <= max_clusters // query_tiles <= 32
         )
@@ -1015,6 +1013,12 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
     # token-strided and block-interleaved layouts against an explicit reference.
     torch.manual_seed(31)
     world, q_len, heads = 2, 5, 96
+    query_tiles = math.ceil(heads * q_len / 128)
+    expected_stream_k = (
+        enable_stream_k
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        and 2 <= decode.get_max_active_clusters(2) // query_tiles <= 32
+    )
     query = torch.randn(1, q_len, heads, 576, device="cuda", dtype=torch.bfloat16)
     query = query.to(torch.float8_e4m3fn)
     for rank in range(world):
@@ -1072,7 +1076,7 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
             min_split_kv=1,
         )
         output, lse = tokenspeed_mla_decode(**kwargs)
-        assert (stream_k_selections[-1] > 0) == enable_stream_k
+        assert (stream_k_selections[-1] > 0) == expected_stream_k
         _check_output(output, expected, "fp8")
         torch.testing.assert_close(lse, expected_lse, atol=0.05, rtol=0.001)
         _, lse = tokenspeed_mla_decode(
@@ -1085,7 +1089,7 @@ def _check_packed_masks_gpu(interleave, enable_stream_k):
         )
 
 
-def _check_stream_k_partition_metadata_gpu(force_int64=False):
+def _check_stream_k_partition_metadata_gpu():
     import cutlass
     import cutlass.cute as cute
     import tokenspeed_mla.mla_helpers as helpers
@@ -1147,7 +1151,7 @@ def _check_stream_k_partition_metadata_gpu(force_int64=False):
         lengths = torch.tensor(values, dtype=torch.int32, device="cuda")
         records = torch.full((groups, batch, 4), -1, dtype=torch.int32, device="cuda")
         ranges = torch.empty(batch, 2, dtype=torch.int32, device="cuda")
-        use_int32 = not force_int64 and _stream_k_int32_safe(
+        use_int32 = _stream_k_int32_safe(
             batch, (max(values) + tile - 1) // tile, groups
         )
         compiled = cute.compile(
@@ -1814,6 +1818,16 @@ class TestGPU:
 
     @pytest.mark.parametrize("partial_fp16", [False, True])
     def test_stream_k_zero_lengths_and_graph_metadata_updates(self, partial_fp16):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+            (10, 0),
+            (10, 3),
+        ):
+            pytest.skip("Balanced scheduling requires SM100 or SM103")
+        from tokenspeed_mla.mla_decode import get_max_active_clusters
+
+        torch.cuda.set_device(torch.cuda.current_device())
+        if not 2 <= get_max_active_clusters(2) // 4 <= 32:
+            pytest.skip("Balanced scheduling requires 2 to 32 resident groups")
         _run_gpu_check(_check_stream_k_zero_lengths_gpu, (partial_fp16,), 240)
 
     @pytest.mark.parametrize(

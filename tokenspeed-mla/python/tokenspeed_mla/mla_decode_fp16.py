@@ -1456,9 +1456,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         p_cor_consumer_state=p_cor_consumer_state,
                         mma_o_consumer_state=mma_o_consumer_state,
                     )
-                elif cutlass.const_expr(
-                    mAccO is None and local_visible_lens is not None
-                ):
+                elif cutlass.const_expr(mAccO is None):
                     # Zero tiles and no reducer: this CTA owns the final empty output.
                     self.write_empty_output(mO, mLSE, blk_coord, tidx)
                 tile_sched.advance_to_next_work()

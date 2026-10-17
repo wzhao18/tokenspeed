@@ -107,6 +107,8 @@ The wrapper keeps tiling, workspace sizing and kernel selection consistent.
 
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
+Empty local KV sequences produce zero output and base-2 LSE of `-inf`,
+including workspace-free decode and DCP ranks with no local keys.
 
 Regression coverage is in [tests/test_mla_decode.py](tests/test_mla_decode.py).
 It checks packed-query geometry, split-KV workspace sizing, FP8/FP16/BF16

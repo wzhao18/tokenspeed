@@ -1381,7 +1381,101 @@ def _check_local_visible_gpu(
         assert torch.isneginf(captured_lse[empty]).all()
 
 
+def _check_empty_kv_gpu(dtype, cp_rank):
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    # B128 makes every dtype select split1; zero workspace rejects a split-KV
+    # launch rather than letting a reducer hide a missing empty-row epilogue.
+    case = _Case(128, 64, 64, 1)
+    q, kv, tables, lengths = _make_inputs(case, dtype, False, "cuda")
+    global_lengths = torch.tensor(
+        [0, 1, 17, 64] * (case.batch // 4), device="cuda", dtype=torch.int32
+    )
+    initial = global_lengths.clone()
+    world, rank = (1, 0) if cp_rank is None else (8, cp_rank)
+    out = torch.empty(
+        case.batch,
+        1,
+        case.heads,
+        512,
+        device="cuda",
+        dtype=torch.float16 if dtype == "fp16" else torch.bfloat16,
+    )
+    kwargs = dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=torch.empty(0, device="cuda", dtype=torch.int8),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=tables,
+        seq_lens=lengths,
+        max_seq_len=case.kv_len,
+        softmax_scale=192**-0.5,
+        out=out,
+        is_var_seq=True,
+        return_lse=True,
+        cp_world=world,
+        cp_rank=rank,
+        cp_interleave_size=128,
+        causal_seqs=global_lengths if cp_rank is not None else None,
+    )
+
+    def update_lengths():
+        cycles = global_lengths // (128 * world)
+        tail = (global_lengths % (128 * world) - rank * 128).clamp(0, 128)
+        lengths.copy_(cycles * 128 + tail)
+
+    update_lengths()
+    tokenspeed_mla_decode(**kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out, captured_lse = tokenspeed_mla_decode(**kwargs)
+    for state in ("mixed", "empty", "restored"):
+        global_lengths.copy_(initial)
+        if state == "empty":
+            global_lengths.zero_()
+        update_lengths()
+        expected = torch.zeros_like(out, dtype=torch.float32)
+        expected_lse = torch.full(
+            (case.batch, 1, case.heads), -torch.inf, device="cuda"
+        )
+        for b, count in enumerate(lengths.tolist()):
+            if count:
+                keys = (
+                    kv.view(torch.uint8)[tables[b, 0].long()]
+                    .view(kv.dtype)
+                    .float()[:count]
+                )
+                scores = q[b, 0].float() @ keys.T * (192**-0.5)
+                expected[b, 0] = scores.softmax(-1) @ keys[:, :512]
+                expected_lse[b, 0] = scores.logsumexp(-1) * math.log2(math.e)
+        out.fill_(torch.nan)
+        eager_out, eager_lse = tokenspeed_mla_decode(**kwargs)
+        torch.cuda.synchronize()
+        _check_output(eager_out, expected, dtype)
+        torch.testing.assert_close(eager_lse, expected_lse, atol=2e-4, rtol=2e-4)
+        out.fill_(torch.nan)
+        captured_lse.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_output(captured_out, expected, dtype)
+        torch.testing.assert_close(captured_lse, expected_lse, atol=2e-4, rtol=2e-4)
+        empty = lengths == 0
+        assert torch.count_nonzero(captured_out[empty]) == 0
+        assert torch.isneginf(captured_lse[empty]).all()
+
+
 class TestGPU:
+    @pytest.mark.parametrize(
+        "dtype,cp_rank",
+        [("fp8", None), ("fp16", None), ("bf16", None)]
+        + [("fp8", rank) for rank in (0, 1, 7)],
+    )
+    def test_empty_kv_without_explicit_visibility(self, dtype, cp_rank):
+        _run_gpu_check(_check_empty_kv_gpu, (dtype, cp_rank), 240)
+
     @pytest.mark.parametrize(
         "dtype,partial_fp16", [("bf16", False), ("fp8", False), ("fp8", True)]
     )

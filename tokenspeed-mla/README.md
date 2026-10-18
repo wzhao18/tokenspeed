@@ -304,6 +304,12 @@ What it supports:
   - 3D: `[num_pages, page_size, D_total]`
   - 4D accepted and normalized internally
 - Auto `split_kv` + workspace sizing and caching
+- Optional `split_kv_counts` (CUDA int32 `[B]`) and `max_split_kv` reuse the
+  existing variable-split kernel and reducer. The caller provides counts in
+  `[1, max_split_kv]` and reserves workspace for that fixed capacity. Counts
+  can change in place during CUDA graph replay, without CPU synchronization.
+  Omission preserves automatic scheduling; explicit counts require variable
+  sequence lengths, `min_split_kv=1`, and non-FP8 output.
 - Supports FP16/BF16/FP8; FP8 path writes BF16 output, or FP8 output on
   SM107 when `out` is FP8 (see [SM107 decode](#sm107-decode)).
 - Supports `H <= 128` and `1 <= q_len <= 4`; for example,

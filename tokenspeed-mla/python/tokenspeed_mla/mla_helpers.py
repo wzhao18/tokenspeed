@@ -40,11 +40,17 @@ def select_mla_decode_tilers(
     is_fp8: bool,
     compute_capability: tuple[int, int],
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Select decode MMA tile shapes from runtime head/q_len configuration.
+    """Select the QK and PV MMA tile shapes used by MLA decode.
 
-    FP16/BF16 path currently supports only M=128 kernels.
-    FP8 path supports an additional M=64 kernel family on SM100 for the tuned
-    H=16, S_q=4 decode shape.
+    Args:
+        num_heads: Number of query heads per token.
+        seq_len_q: Query tokens per request.
+        is_fp8: Whether the query uses FP8 E4M3.
+        compute_capability: CUDA device capability (major, minor).
+
+    Returns:
+        QK and PV (M, N) tile shapes. FP8 uses M=64 on SM100 when the query
+        has at most 64 head rows; all other supported layouts use M=128.
     """
     get_mla_decode_arch(compute_capability)
     default_qk = (128, 128)

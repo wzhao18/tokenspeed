@@ -24,6 +24,7 @@ try:
     from tokenspeed_mla.mla_decode import (
         tokenspeed_mla_decode,
     )
+    from tokenspeed_mla.mla_helpers import select_mla_decode_tilers
     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
         mla_kv_pack_quantize_fp8,
     )
@@ -45,6 +46,7 @@ except ImportError as exc:
     tokenspeed_mla_prefill = _unavailable
     mla_kv_pack_quantize_fp8 = _unavailable
     get_num_sm = _unavailable
+    select_mla_decode_tilers = _unavailable
     warmup_compile_prefill = _unavailable
 
 __all__ = [
@@ -52,5 +54,6 @@ __all__ = [
     "tokenspeed_mla_prefill",
     "mla_kv_pack_quantize_fp8",
     "get_num_sm",
+    "select_mla_decode_tilers",
     "warmup_compile_prefill",
 ]

@@ -96,14 +96,18 @@ def _get_split_kv_and_workspace_size(
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
     min_split_kv: int = 1,
+    max_split_kv: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Return cached split count and workspace bytes for the effective Q layout.
 
     FP8 normalizes uniform K partitions before sizing the workspace so the
     launch grid, scratch strides and reducer use the same nonempty split count.
+    Explicit per-request counts instead reserve a fixed grid/workspace capacity.
     """
     is_fp8 = torch_dtype == torch.float8_e4m3fn
-    if is_fp8 and mma_qk_tiler_mn[0] == 64:
+    if max_split_kv is not None:
+        split_kv = max_split_kv
+    elif is_fp8 and mma_qk_tiler_mn[0] == 64:
         # M64 launches one CTA per M tile. Reuse the FP8 kernel's wave-aware
         # split heuristic so serving matches the standalone mla_decode_fp8.py
         # benchmark path instead of under-splitting like the 2-CTA M128 path.
@@ -120,7 +124,7 @@ def _get_split_kv_and_workspace_size(
             B, q_len, max_active_blocks
         )
     split_kv = max(split_kv, min_split_kv)
-    if is_fp8:
+    if is_fp8 and max_split_kv is None:
         # The occupancy candidate may contain empty final partitions (e.g.
         # 32 splits for only 8 K tiles). Preserve the uniform chunk width while
         # removing those partitions, as in FlashInfer PR #4178.
@@ -130,10 +134,8 @@ def _get_split_kv_and_workspace_size(
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
-    if min_split_kv > 1 and workspace_size >= 1 << 31:
-        raise ValueError(
-            "min_split_kv requires workspace beyond the Int32 offset limit"
-        )
+    if (min_split_kv > 1 or max_split_kv is not None) and workspace_size >= 1 << 31:
+        raise ValueError("split-KV workspace exceeds the Int32 offset limit")
     return split_kv, workspace_size
 
 
@@ -758,6 +760,8 @@ def tokenspeed_mla_decode(
     *,
     min_split_kv: int = 1,
     local_visible_lens: Optional[torch.Tensor] = None,
+    split_kv_counts: Optional[torch.Tensor] = None,
+    max_split_kv: Optional[int] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
@@ -854,6 +858,20 @@ def tokenspeed_mla_decode(
         The effective value is capped to avoid creating empty partitions.
         Defaults to 1, which enables automatic split selection.
 
+    split_kv_counts : torch.Tensor, optional
+        Contiguous int32 [B] tensor on the query device specifying each
+        request's split count. Requires ``is_var_seq=True`` and an explicit
+        ``max_split_kv``; cannot be combined with ``min_split_kv != 1`` or
+        SM107 FP8 output. Values must be in [1, max_split_kv], including for
+        padded requests. The caller owns planning and value validation; no
+        device-to-host copy is performed. Counts may change in place between
+        CUDA graph replays.
+    max_split_kv : int, optional
+        Fixed split-grid and workspace capacity in [1, 256], required only
+        with ``split_kv_counts``. The workspace formula above uses this
+        capacity in place of the automatic split count. Unused grid positions
+        are handled by the existing variable-split kernel and reducer.
+
     local_visible_lens : torch.Tensor, optional
         Contiguous int32 [B, q_len] tensor on the query device, supported with
         BF16 or FP8 E4M3 Q/KV.
@@ -885,6 +903,28 @@ def tokenspeed_mla_decode(
     ), f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
+
+    if split_kv_counts is None:
+        if max_split_kv is not None:
+            raise ValueError("max_split_kv requires split_kv_counts")
+    else:
+        if type(max_split_kv) is not int or not 1 <= max_split_kv <= 256:
+            raise ValueError("split_kv_counts requires max_split_kv in [1, 256]")
+        if min_split_kv != 1 or not is_var_seq:
+            raise ValueError(
+                "split_kv_counts requires min_split_kv=1 and is_var_seq=True"
+            )
+        if out is not None and out.dtype == torch.float8_e4m3fn:
+            raise ValueError("split_kv_counts is not supported with FP8 output")
+        if (
+            split_kv_counts.shape != (B,)
+            or split_kv_counts.dtype != torch.int32
+            or split_kv_counts.device != query.device
+            or not split_kv_counts.is_contiguous()
+        ):
+            raise ValueError(
+                "split_kv_counts must be contiguous int32 [B] on the query device"
+            )
 
     if local_visible_lens is not None:
         if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
@@ -1012,6 +1052,7 @@ def tokenspeed_mla_decode(
         q_dtype,
         mma_qk_tiler_mn,
         min_split_kv,
+        max_split_kv,
     )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
@@ -1083,8 +1124,8 @@ def tokenspeed_mla_decode(
             else causal_seqs.to(torch.int32)
         )
 
-    is_var_split_kv = False
-    block_split_kvs = None
+    is_var_split_kv = split_kv_counts is not None
+    block_split_kvs = split_kv_counts
     # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
     skip_correction_threshold = 8.0 if is_fp8 else 0.0
 
